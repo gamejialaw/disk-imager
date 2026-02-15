@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/disk_imager.conf"
 
-DEFAULT_SOURCE_DISK="/dev/nvme0"
+DEFAULT_SOURCE_DISK="auto"
 DEFAULT_BACKUP_ROOT="/root/samba"
 DEFAULT_NAME_PREFIX="disk-image"
 
@@ -46,6 +46,70 @@ require_root() {
   if [[ "$(id -u)" -ne 0 ]]; then
     die "This script must run as root (or set SKIP_ROOT_CHECK=1 for tests)."
   fi
+}
+
+resolve_disk_device() {
+  local disk="$1"
+  if [[ "$SKIP_ROOT_CHECK" == "1" ]]; then
+    printf '%s\n' "$disk"
+    return
+  fi
+  if [[ -b "$disk" ]]; then
+    printf '%s\n' "$disk"
+    return
+  fi
+
+  # Common pitfall: /dev/nvme0 is a controller node, while /dev/nvme0n1 is the disk.
+  if [[ "$disk" =~ ^/dev/nvme[0-9]+$ ]] && [[ -b "${disk}n1" ]]; then
+    log "Device $disk is a controller node; using ${disk}n1"
+    printf '%s\n' "${disk}n1"
+    return
+  fi
+
+  die "Device is not a block disk: $disk (for NVMe use /dev/nvmeXn1)"
+}
+
+is_nvme_controller_node() {
+  local disk="$1"
+  local node="${disk##/dev/}"
+  [[ "$disk" =~ ^/dev/nvme[0-9]+$ ]] || return 1
+  [[ -e "/sys/class/nvme/$node" ]] || return 1
+  [[ ! -b "$disk" ]]
+}
+
+confirm_nvme_controller() {
+  local disk="$1"
+  if [[ "$SKIP_ROOT_CHECK" == "1" ]]; then
+    return 1
+  fi
+  is_nvme_controller_node "$disk"
+}
+
+auto_detect_source_disk() {
+  if [[ "$SKIP_ROOT_CHECK" == "1" ]]; then
+    printf '%s\n' "/dev/mock0"
+    return
+  fi
+
+  if [[ -b /dev/nvme0n1 ]]; then
+    printf '%s\n' "/dev/nvme0n1"
+    return
+  fi
+
+  require_cmd lsblk
+  local disk
+  disk="$(lsblk -dnpo NAME,TYPE,RM 2>/dev/null | awk '$2=="disk" && $3==0 {print $1; exit}')"
+  [[ -n "$disk" ]] || die "Could not auto-detect a non-removable disk. Use --source <disk>."
+  printf '%s\n' "$disk"
+}
+
+resolve_source_disk() {
+  local disk="${1:-}"
+  if [[ -z "$disk" || "$disk" == "auto" ]]; then
+    disk="$(auto_detect_source_disk)"
+    log "Auto-detected source disk: $disk"
+  fi
+  resolve_disk_device "$disk"
 }
 
 part_path_from_num() {
@@ -120,6 +184,74 @@ list_partitions() {
   lsblk -lnpo NAME,TYPE,FSTYPE "$disk" | awk '$2 == "part" {print $1"\t"$3}'
 }
 
+preflight_backup() {
+  local disk="$1"
+  local backup_root="$2"
+  local mode_ptable="dd+gzip"
+
+  log "Preflight (backup)"
+  log "Source disk: $disk"
+  log "Backup root: $backup_root"
+
+  if has_cmd sfdisk; then
+    mode_ptable="sfdisk"
+  fi
+  log "Partition table backup method: $mode_ptable"
+
+  if has_cmd sfdisk; then log "Tool available: sfdisk"; else log "Tool missing: sfdisk (fallback active)"; fi
+  if has_cmd dd; then log "Tool available: dd"; else die "Required fallback tool missing: dd"; fi
+  if has_cmd gzip; then log "Tool available: gzip"; else die "Required fallback tool missing: gzip"; fi
+
+  if confirm_nvme_controller "/dev/nvme0"; then
+    log "Confirmed: /dev/nvme0 is an NVMe controller node (non-block); use /dev/nvme0n1 for disk imaging."
+  fi
+
+  local part fstype tool
+  while IFS=$'\t' read -r part fstype; do
+    [[ -n "$part" ]] || continue
+    tool="$(partclone_tool_for_fstype "$fstype")"
+    if has_cmd "$tool"; then
+      log "Partition $part fstype=${fstype:-unknown} -> method=partclone ($tool)"
+    else
+      log "Partition $part fstype=${fstype:-unknown} -> method=dd+gzip (missing $tool)"
+    fi
+  done < <(list_partitions "$disk")
+}
+
+preflight_restore() {
+  local target_disk="$1"
+  local backup_dir="$2"
+  local ptable_method="dd+gzip"
+
+  log "Preflight (restore)"
+  log "Target disk: $target_disk"
+  log "Backup dir: $backup_dir"
+
+  [[ -d "$backup_dir" ]] || die "Backup directory does not exist: $backup_dir"
+  [[ -f "$backup_dir/manifest.tsv" ]] || die "Missing manifest.tsv"
+
+  if [[ -f "$backup_dir/partition_table.sfdisk" ]] && has_cmd sfdisk; then
+    ptable_method="sfdisk"
+  fi
+  log "Partition table restore method: $ptable_method"
+
+  local partn fstype tool relimg img
+  while IFS=$'\t' read -r partn fstype tool relimg; do
+    [[ -n "$partn" ]] || continue
+    img="$backup_dir/$relimg"
+    [[ -f "$img" ]] || die "Missing image file: $img"
+    if [[ "$tool" == "dd+gzip" ]]; then
+      log "Partition $partn restore method=dd+gzip"
+    elif has_cmd "$tool"; then
+      log "Partition $partn restore method=partclone ($tool)"
+    elif [[ "$img" == *.gz ]]; then
+      log "Partition $partn restore method=dd+gzip fallback (missing $tool)"
+    else
+      die "Partition $partn cannot be restored: missing $tool and image is not .gz"
+    fi
+  done <"$backup_dir/manifest.tsv"
+}
+
 backup_drive() {
   local disk="$1"
   local backup_root="$2"
@@ -129,6 +261,7 @@ backup_drive() {
   require_cmd lsblk sha256sum dd gzip
 
   local stamp backup_name outdir
+  disk="$(resolve_source_disk "$disk")"
   stamp="$(date '+%Y%m%d-%H%M%S')"
   if [[ -n "$name_override" ]]; then
     backup_name="$name_override"
@@ -137,6 +270,7 @@ backup_drive() {
   fi
   outdir="${backup_root%/}/$backup_name"
 
+  preflight_backup "$disk" "$backup_root"
   ensure_backup_dir "$outdir"
   save_metadata "$disk" "$outdir"
 
@@ -232,11 +366,13 @@ restore_drive() {
 
   require_root
   require_cmd lsblk partprobe udevadm dd gzip
+  target_disk="$(resolve_disk_device "$target_disk")"
   [[ -d "$backup_dir" ]] || die "Backup directory does not exist: $backup_dir"
   [[ -f "$backup_dir/partition_table.sfdisk" || -f "$backup_dir/disk-head-2MiB.bin.gz" ]] || die "Missing partition table backup files"
   [[ -f "$backup_dir/manifest.tsv" ]] || die "Missing manifest.tsv"
 
   verify_backup "$backup_dir"
+  preflight_restore "$target_disk" "$backup_dir"
 
   if [[ "$assume_yes" != "1" ]]; then
     printf 'About to wipe and restore %s from %s\n' "$target_disk" "$backup_dir"
@@ -391,13 +527,14 @@ TXT
 usage() {
   cat <<'TXT'
 Usage:
-  disk_imager.sh backup  --source <disk> --backup-root <dir> [--name <backup-name>]
+  disk_imager.sh preflight --source <disk|auto> [--backup-root <dir>] [--backup-dir <dir>] [--target <disk>]
+  disk_imager.sh backup  --source <disk|auto> --backup-root <dir> [--name <backup-name>]
   disk_imager.sh restore --target <disk> --backup-dir <dir> [--yes]
   disk_imager.sh verify  --backup-dir <dir> [--compare-disk <disk>]
   disk_imager.sh tui
 
 Defaults can be set in disk_imager.conf:
-  SOURCE_DISK=/dev/nvme0
+  SOURCE_DISK=auto
   BACKUP_ROOT=/root/samba
   NAME_PREFIX=disk-image
 TXT
@@ -430,6 +567,14 @@ main() {
   done
 
   case "$cmd" in
+    preflight)
+      source="$(resolve_source_disk "$source")"
+      preflight_backup "$source" "$backup_root"
+      if [[ -n "$backup_dir" ]]; then
+        target="$(resolve_source_disk "$target")"
+        preflight_restore "$target" "$backup_dir"
+      fi
+      ;;
     backup)
       backup_drive "$source" "$backup_root" "$name"
       ;;
@@ -439,6 +584,9 @@ main() {
       ;;
     verify)
       [[ -n "$backup_dir" ]] || die "--backup-dir is required for verify"
+      if [[ -n "$compare_disk" ]]; then
+        compare_disk="$(resolve_disk_device "$compare_disk")"
+      fi
       verify_backup "$backup_dir" "$compare_disk"
       ;;
     tui)
