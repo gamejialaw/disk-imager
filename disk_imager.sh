@@ -19,10 +19,70 @@ NAME_PREFIX="${NAME_PREFIX:-$DEFAULT_NAME_PREFIX}"
 
 SKIP_ROOT_CHECK="${SKIP_ROOT_CHECK:-0}"
 SKIP_RAW_HEADERS="${DISK_IMAGER_SKIP_RAW_HEADERS:-0}"
+DEBUG="${DEBUG:-0}"
+LOG_FILE="${DISK_IMAGER_LOG_FILE:-}"
 
-log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
-err() { printf 'ERROR: %s\n' "$*" >&2; }
-die() { err "$*"; exit 1; }
+_write_log_line() {
+  local line="$1"
+  printf '%s\n' "$line" >&2
+  if [[ -n "${LOG_FILE:-}" ]]; then
+    printf '%s\n' "$line" >>"$LOG_FILE" 2>/dev/null || true
+  fi
+}
+
+log() { _write_log_line "[$(date '+%F %T')] $*"; }
+debug_log() {
+  if [[ "${DEBUG:-0}" == "1" ]]; then
+    _write_log_line "[DEBUG $(date '+%F %T')] $*"
+  fi
+}
+err() { _write_log_line "ERROR: $*"; }
+die() {
+  err "$*"
+  if [[ -n "${LOG_FILE:-}" ]]; then
+    err "Debug log: $LOG_FILE"
+  fi
+  exit 1
+}
+
+init_logging() {
+  if [[ -n "${LOG_FILE:-}" ]]; then
+    mkdir -p "$(dirname -- "$LOG_FILE")" 2>/dev/null || true
+    : >"$LOG_FILE" || die "Cannot write log file: $LOG_FILE"
+    log "Logging enabled: $LOG_FILE"
+  fi
+}
+
+run_debug_cmd() {
+  local label="$1"
+  shift
+  local out rc
+  debug_log "CMD: $*"
+  out="$("$@" 2>&1)" || rc=$?
+  rc="${rc:-0}"
+  if [[ -n "$out" ]]; then
+    while IFS= read -r line; do
+      debug_log "$label: $line"
+    done <<< "$out"
+  fi
+  debug_log "$label exit=$rc"
+}
+
+emit_debug_snapshot() {
+  [[ "${DEBUG:-0}" == "1" ]] || return 0
+  debug_log "===== Debug Snapshot Start ====="
+  run_debug_cmd "id" id
+  run_debug_cmd "uname" uname -a
+  run_debug_cmd "pwd" pwd
+  run_debug_cmd "mount" mount
+  run_debug_cmd "lsblk_disks" lsblk -d -o NAME,PATH,TYPE,SIZE,MODEL
+  run_debug_cmd "lsblk_all" lsblk -o NAME,PATH,TYPE,FSTYPE,SIZE,MOUNTPOINT
+  run_debug_cmd "ls_dev_nvme" ls -l /dev/nvme0 /dev/nvme0n1 /dev/nvme0n1p1 /dev/nvme0n1p2 /dev/nvme0n1p3 /dev/nvme0n1p4
+  run_debug_cmd "test_nvme0n1_block" bash -lc 'if test -b /dev/nvme0n1; then echo "/dev/nvme0n1 is block"; else echo "/dev/nvme0n1 is NOT block"; fi'
+  run_debug_cmd "sys_block" ls -l /sys/block
+  run_debug_cmd "sys_nvme" ls -l /sys/class/nvme
+  debug_log "===== Debug Snapshot End ====="
+}
 
 require_cmd() {
   local missing=()
@@ -484,6 +544,7 @@ restore_drive() {
 choose_with_whiptail() {
   whiptail --title "Disk Imager" --menu "Choose an action" 16 70 8 \
     "backup" "Create backup image set" \
+    "quick-backup" "One-step backup (auto disk + default path)" \
     "restore" "Restore disk from backup" \
     "verify" "Verify backup integrity" \
     "exit" "Quit" 3>&1 1>&2 2>&3
@@ -498,6 +559,9 @@ input_with_whiptail() {
 
 run_tui() {
   local action
+  if [[ -n "${LOG_FILE:-}" ]]; then
+    log "TUI debug log file: $LOG_FILE"
+  fi
   if command -v whiptail >/dev/null 2>&1; then
     while true; do
       action="$(choose_with_whiptail || true)"
@@ -508,6 +572,9 @@ run_tui() {
           dir="$(input_with_whiptail "Backup" "Backup root directory" "$BACKUP_ROOT")" || continue
           name="$(input_with_whiptail "Backup" "Backup name (blank = auto)" "")" || true
           backup_drive "$disk" "$dir" "$name"
+          ;;
+        quick-backup)
+          backup_drive "auto" "$BACKUP_ROOT" ""
           ;;
         restore)
           local tdisk bdir
@@ -529,7 +596,7 @@ run_tui() {
   else
     cat <<'TXT'
 whiptail not found. Falling back to text prompts.
-Actions: backup | restore | verify | exit
+Actions: backup | quick-backup | restore | verify | exit
 TXT
     while true; do
       printf 'Action: '
@@ -541,6 +608,9 @@ TXT
           printf 'Backup root [%s]: ' "$BACKUP_ROOT"; read -r dir; dir="${dir:-$BACKUP_ROOT}"
           printf 'Backup name (blank=auto): '; read -r name
           backup_drive "$disk" "$dir" "$name"
+          ;;
+        quick-backup)
+          backup_drive "auto" "$BACKUP_ROOT" ""
           ;;
         restore)
           local tdisk bdir
@@ -564,10 +634,12 @@ usage() {
   cat <<'TXT'
 Usage:
   disk_imager.sh preflight --source <disk|auto> [--backup-root <dir>] [--backup-dir <dir>] [--target <disk>]
+  disk_imager.sh quick-backup|qb [--source <disk|auto>] [--backup-root <dir>] [--name <backup-name>]
   disk_imager.sh backup  --source <disk|auto> --backup-root <dir> [--name <backup-name>]
   disk_imager.sh restore --target <disk> --backup-dir <dir> [--yes]
   disk_imager.sh verify  --backup-dir <dir> [--compare-disk <disk>]
   disk_imager.sh tui
+  disk_imager.sh <cmd> [--debug] [--log-file <path>]
 
 Defaults can be set in disk_imager.conf:
   SOURCE_DISK=auto
@@ -597,10 +669,26 @@ main() {
       --compare-disk) compare_disk="$2"; shift 2 ;;
       --name) name="$2"; shift 2 ;;
       --yes) yes=1; shift ;;
+      --debug) DEBUG=1; shift ;;
+      --log-file) LOG_FILE="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) die "Unknown argument: $1" ;;
     esac
   done
+
+  if [[ "$cmd" == "tui" && "$DEBUG" != "1" && -z "$LOG_FILE" ]]; then
+    DEBUG=1
+    LOG_FILE="/tmp/disk_imager_tui_$(date '+%Y%m%d_%H%M%S').log"
+  fi
+  if [[ ( "$cmd" == "quick-backup" || "$cmd" == "qb" ) && "$DEBUG" != "1" && -z "$LOG_FILE" ]]; then
+    DEBUG=1
+    LOG_FILE="/tmp/disk_imager_quick_$(date '+%Y%m%d_%H%M%S').log"
+  fi
+  if [[ "$DEBUG" == "1" && -z "$LOG_FILE" ]]; then
+    LOG_FILE="/tmp/disk_imager_debug_$(date '+%Y%m%d_%H%M%S').log"
+  fi
+  init_logging
+  emit_debug_snapshot
 
   case "$cmd" in
     preflight)
@@ -613,6 +701,9 @@ main() {
       ;;
     backup)
       backup_drive "$source" "$backup_root" "$name"
+      ;;
+    quick-backup|qb)
+      backup_drive "${source:-auto}" "$backup_root" "$name"
       ;;
     restore)
       [[ -n "$backup_dir" ]] || die "--backup-dir is required for restore"
