@@ -2,6 +2,9 @@
 
 `disk_imager.sh` creates disk backups with partition-table metadata and per-partition images, then restores from those backups.
 
+Optional safe mode:
+- Whole-disk image: `--safe-full-image` creates one compressed file (`disk-full.img.gz`) containing the entire disk.
+
 Default behavior:
 - Partition table: `sfdisk`
 - Partition images: `partclone`
@@ -27,6 +30,7 @@ Backup safety checks (automatic):
 Each backup snapshot directory contains:
 - `partition_table.sfdisk` and `partition_table.json` (when `sfdisk` is available)
 - `disk-head-2MiB.bin.gz` and `disk-tail-2MiB.bin.gz` (raw table/header fallback data)
+- `disk-full.img.gz` (only when `--safe-full-image` is used)
 - `manifest.tsv` (partition -> image mapping + method used)
 - `inventory.tsv` (captured source partition inventory before imaging)
 - `checksums.txt` (sha256 for each image)
@@ -46,6 +50,12 @@ Create backup:
 
 ```bash
 sudo /share/saveas/disk_imager.sh backup --source auto --backup-root /root/samba
+```
+
+Create a single-file compressed full-disk backup (safe mode):
+
+```bash
+sudo /share/saveas/disk_imager.sh backup --source /dev/nvme0n1 --backup-root /root/samba --safe-full-image
 ```
 
 Short command (auto source + default backup root + debug log):
@@ -155,13 +165,14 @@ Current suites:
   - disk `/dev/nvme0n1`
   - partitions `p1 vfat`, `p2 unknown/MSR-like`, `p3 ntfs`, `p4 ntfs`
   - asserts `p2` uses `dd+gzip` while filesystem partitions use `partclone`
+- Safe full-disk image path: `--safe-full-image` creates and restores `disk-full.img.gz`
 
 ## Command Reference
 
 ```bash
-disk_imager.sh preflight --source <disk|auto> [--backup-root <dir>] [--backup-dir <dir>] [--target <disk>] [--debug] [--log-file <path>]
-disk_imager.sh quick-backup|qb [--source <disk|auto>] [--backup-root <dir>] [--name <backup-name>] [--debug] [--log-file <path>]
-disk_imager.sh backup    --source <disk|auto> --backup-root <dir> [--name <backup-name>] [--debug] [--log-file <path>]
+disk_imager.sh preflight --source <disk|auto> [--backup-root <dir>] [--backup-dir <dir>] [--target <disk>] [--safe-full-image] [--debug] [--log-file <path>]
+disk_imager.sh quick-backup|qb [--source <disk|auto>] [--backup-root <dir>] [--name <backup-name>] [--safe-full-image] [--debug] [--log-file <path>]
+disk_imager.sh backup    --source <disk|auto> --backup-root <dir> [--name <backup-name>] [--safe-full-image] [--debug] [--log-file <path>]
 disk_imager.sh restore   --target <disk> --backup-dir <dir> [--yes] [--debug] [--log-file <path>]
 disk_imager.sh verify    --backup-dir <dir> [--compare-disk <disk>] [--debug] [--log-file <path>]
 disk_imager.sh tui

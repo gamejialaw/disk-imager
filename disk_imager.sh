@@ -266,6 +266,7 @@ ensure_backup_dir() {
 save_metadata() {
   local disk="$1"
   local outdir="$2"
+  local backup_mode="${3:-partitioned-images}"
 
   local ptable_method=""
   if has_cmd sfdisk; then
@@ -284,6 +285,7 @@ save_metadata() {
     echo "hostname=$(hostname 2>/dev/null || true)"
     echo "kernel=$(uname -r 2>/dev/null || true)"
     echo "partition_table_method=$ptable_method"
+    echo "backup_mode=$backup_mode"
   } >"$outdir/metadata.txt"
 
   # Always keep compressed raw table headers as a robust fallback.
@@ -401,11 +403,13 @@ post_backup_audit() {
 preflight_backup() {
   local disk="$1"
   local backup_root="$2"
+  local backup_mode="${3:-partitioned-images}"
   local mode_ptable="dd+gzip"
 
   log "Preflight (backup)"
   log "Source disk: $disk"
   log "Backup root: $backup_root"
+  log "Backup mode: $backup_mode"
   if [[ "$ALLOW_MOUNTED_SOURCE" == "1" ]]; then
     log "Mounted source check: disabled (ALLOW_MOUNTED_SOURCE=1)"
   else
@@ -425,6 +429,11 @@ preflight_backup() {
     log "Confirmed: /dev/nvme0 is an NVMe controller node (non-block); use /dev/nvme0n1 for disk imaging."
   fi
 
+  if [[ "$backup_mode" == "full-disk-image" ]]; then
+    log "Whole-disk compressed image mode enabled (single file)."
+    return 0
+  fi
+
   local part fstype tool
   while IFS=$'\t' read -r part fstype; do
     [[ -n "$part" ]] || continue
@@ -440,6 +449,7 @@ preflight_backup() {
 preflight_restore() {
   local target_disk="$1"
   local backup_dir="$2"
+  local backup_mode="$3"
   local ptable_method="dd+gzip"
 
   log "Preflight (restore)"
@@ -448,6 +458,16 @@ preflight_restore() {
 
   [[ -d "$backup_dir" ]] || die "Backup directory does not exist: $backup_dir"
   [[ -f "$backup_dir/manifest.tsv" ]] || die "Missing manifest.tsv"
+  log "Backup mode: $backup_mode"
+
+  if [[ "$backup_mode" == "full-disk-image" ]]; then
+    local relimg
+    relimg="$(awk -F'\t' 'NF>0{print $4; exit}' "$backup_dir/manifest.tsv")"
+    [[ -n "$relimg" ]] || die "Missing full-disk image entry in manifest.tsv"
+    [[ -f "$backup_dir/$relimg" ]] || die "Missing full-disk image file: $backup_dir/$relimg"
+    log "Restore method: whole-disk dd+gzip"
+    return 0
+  fi
 
   if [[ -f "$backup_dir/partition_table.sfdisk" ]] && has_cmd sfdisk; then
     ptable_method="sfdisk"
@@ -489,10 +509,10 @@ backup_drive() {
   fi
   outdir="${backup_root%/}/$backup_name"
 
-  preflight_backup "$disk" "$backup_root"
+  preflight_backup "$disk" "$backup_root" "partitioned-images"
   ensure_source_not_mounted "$disk"
   ensure_backup_dir "$outdir"
-  save_metadata "$disk" "$outdir"
+  save_metadata "$disk" "$outdir" "partitioned-images"
   collect_partition_inventory "$disk" "$outdir"
 
   : >"$outdir/manifest.tsv"
@@ -540,18 +560,102 @@ backup_drive() {
   printf '%s\n' "$outdir"
 }
 
+backup_drive_full_image() {
+  local disk="$1"
+  local backup_root="$2"
+  local name_override="${3:-}"
+
+  require_root
+  require_cmd lsblk sha256sum dd gzip
+
+  local stamp backup_name outdir relimg img sum
+  disk="$(resolve_source_disk "$disk")"
+  stamp="$(date '+%Y%m%d-%H%M%S')"
+  if [[ -n "$name_override" ]]; then
+    backup_name="$name_override"
+  else
+    backup_name="${NAME_PREFIX}-${stamp}"
+  fi
+  outdir="${backup_root%/}/$backup_name"
+
+  preflight_backup "$disk" "$backup_root" "full-disk-image"
+  ensure_source_not_mounted "$disk"
+  ensure_backup_dir "$outdir"
+  save_metadata "$disk" "$outdir" "full-disk-image"
+  collect_partition_inventory "$disk" "$outdir"
+
+  : >"$outdir/manifest.tsv"
+  : >"$outdir/checksums.txt"
+
+  relimg="disk-full.img.gz"
+  img="$outdir/$relimg"
+  log "Backing up whole disk $disk (method=dd+gzip, single-file image)"
+  run_cmd_logged "dd+gzip full-disk backup $disk" bash -c 'dd if="$1" bs=16M status=none | gzip -1 >"$2"' _ "$disk" "$img" || die "dd+gzip full-disk backup failed for $disk"
+
+  sum="$(sha256sum "$img" | awk '{print $1}')"
+  printf '%s  %s\n' "$sum" "$relimg" >>"$outdir/checksums.txt"
+  printf 'disk\tfull\tdd+gzip\t%s\n' "$relimg" >>"$outdir/manifest.tsv"
+
+  validate_image_integrity "$outdir" "dd+gzip" "$relimg" || die "Audit failed: integrity check failed for $relimg"
+  {
+    echo "backup_audit_time_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    echo "mode=full-disk-image"
+    echo "image=$relimg"
+    echo "result=ok"
+  } >"$outdir/audit_report.txt"
+
+  log "Backup finished: $outdir"
+  printf '%s\n' "$outdir"
+}
+
+backup_mode_from_dir() {
+  local backup_dir="$1"
+  local mode="partitioned-images"
+  if [[ -f "$backup_dir/metadata.txt" ]]; then
+    mode="$(awk -F'=' '/^backup_mode=/{print $2; exit}' "$backup_dir/metadata.txt" | tr -d '[:space:]')"
+  fi
+  if [[ "$mode" == "full-disk-image" || "$mode" == "partitioned-images" ]]; then
+    printf '%s\n' "$mode"
+    return 0
+  fi
+  mode="$(awk -F'\t' 'NF>0{print $1; exit}' "$backup_dir/manifest.tsv" 2>/dev/null || true)"
+  if [[ "$mode" == "disk" ]]; then
+    printf '%s\n' "full-disk-image"
+  else
+    printf '%s\n' "partitioned-images"
+  fi
+}
+
 verify_backup() {
   local backup_dir="$1"
   local compare_disk="${2:-}"
+  local backup_mode
 
   require_cmd sha256sum
   [[ -d "$backup_dir" ]] || die "Backup directory does not exist: $backup_dir"
   [[ -f "$backup_dir/manifest.tsv" ]] || die "Missing manifest.tsv"
   [[ -f "$backup_dir/checksums.txt" ]] || die "Missing checksums.txt"
-  [[ -f "$backup_dir/partition_table.sfdisk" || -f "$backup_dir/disk-head-2MiB.bin.gz" ]] || die "Missing partition table backup files"
+  backup_mode="$(backup_mode_from_dir "$backup_dir")"
+  if [[ "$backup_mode" != "full-disk-image" ]]; then
+    [[ -f "$backup_dir/partition_table.sfdisk" || -f "$backup_dir/disk-head-2MiB.bin.gz" ]] || die "Missing partition table backup files"
+  fi
+  log "Backup mode: $backup_mode"
 
   log "Checking checksums"
   (cd "$backup_dir" && sha256sum -c checksums.txt >/dev/null)
+
+  if [[ "$backup_mode" == "full-disk-image" ]]; then
+    local relimg
+    relimg="$(awk -F'\t' 'NF>0{print $4; exit}' "$backup_dir/manifest.tsv")"
+    [[ -n "$relimg" ]] || die "Missing full-disk image entry in manifest.tsv"
+    [[ -f "$backup_dir/$relimg" ]] || die "Image missing: $relimg"
+    validate_image_integrity "$backup_dir" "dd+gzip" "$relimg" || die "Backup verification failed: image integrity check failed for $relimg"
+    if [[ -n "$compare_disk" ]]; then
+      log "Skipping partition-layout compare for full-disk image backup mode."
+    fi
+    log "Backup verification successful: $backup_dir"
+    return 0
+  fi
 
   local partn fstype tool relimg
   while IFS=$'\t' read -r partn fstype tool relimg; do
@@ -594,13 +698,17 @@ restore_drive() {
 
   require_root
   require_cmd lsblk partprobe udevadm dd gzip
+  local backup_mode
   target_disk="$(resolve_disk_device "$target_disk")"
   [[ -d "$backup_dir" ]] || die "Backup directory does not exist: $backup_dir"
-  [[ -f "$backup_dir/partition_table.sfdisk" || -f "$backup_dir/disk-head-2MiB.bin.gz" ]] || die "Missing partition table backup files"
   [[ -f "$backup_dir/manifest.tsv" ]] || die "Missing manifest.tsv"
+  backup_mode="$(backup_mode_from_dir "$backup_dir")"
+  if [[ "$backup_mode" != "full-disk-image" ]]; then
+    [[ -f "$backup_dir/partition_table.sfdisk" || -f "$backup_dir/disk-head-2MiB.bin.gz" ]] || die "Missing partition table backup files"
+  fi
 
   verify_backup "$backup_dir"
-  preflight_restore "$target_disk" "$backup_dir"
+  preflight_restore "$target_disk" "$backup_dir" "$backup_mode"
 
   if [[ "$assume_yes" != "1" ]]; then
     printf 'About to wipe and restore %s from %s\n' "$target_disk" "$backup_dir"
@@ -620,6 +728,20 @@ restore_drive() {
 
   if command -v wipefs >/dev/null 2>&1; then
     wipefs -a "$target_disk" || true
+  fi
+
+  if [[ "$backup_mode" == "full-disk-image" ]]; then
+    local relimg img
+    relimg="$(awk -F'\t' 'NF>0{print $4; exit}' "$backup_dir/manifest.tsv")"
+    [[ -n "$relimg" ]] || die "Missing full-disk image entry in manifest.tsv"
+    img="$backup_dir/$relimg"
+    [[ -f "$img" ]] || die "Missing full-disk image file: $img"
+    log "Restoring whole disk $target_disk from $relimg"
+    run_cmd_logged "dd+gzip full-disk restore $target_disk" bash -c 'gzip -dc "$1" | dd of="$2" bs=16M conv=fsync status=none' _ "$img" "$target_disk" || die "dd+gzip full-disk restore failed for $target_disk"
+    partprobe "$target_disk" || true
+    udevadm settle || true
+    log "Restore completed: $target_disk"
+    return 0
   fi
 
   if has_cmd sfdisk && [[ -f "$backup_dir/partition_table.sfdisk" ]]; then
@@ -683,6 +805,7 @@ restore_drive() {
 choose_with_whiptail() {
   whiptail --title "Disk Imager" --menu "Choose an action" 16 70 8 \
     "backup" "Create backup image set" \
+    "safe-backup" "Create single-file full-disk backup" \
     "quick-backup" "One-step backup (auto disk + default path)" \
     "restore" "Restore disk from backup" \
     "verify" "Verify backup integrity" \
@@ -712,6 +835,13 @@ run_tui() {
           name="$(input_with_whiptail "Backup" "Backup name (blank = auto)" "")" || true
           backup_drive "$disk" "$dir" "$name"
           ;;
+        safe-backup)
+          local sdisk sdir sname
+          sdisk="$(input_with_whiptail "Safe Backup" "Source disk" "$SOURCE_DISK")" || continue
+          sdir="$(input_with_whiptail "Safe Backup" "Backup root directory" "$BACKUP_ROOT")" || continue
+          sname="$(input_with_whiptail "Safe Backup" "Backup name (blank = auto)" "")" || true
+          backup_drive_full_image "$sdisk" "$sdir" "$sname"
+          ;;
         quick-backup)
           backup_drive "auto" "$BACKUP_ROOT" ""
           ;;
@@ -735,7 +865,7 @@ run_tui() {
   else
     cat <<'TXT'
 whiptail not found. Falling back to text prompts.
-Actions: backup | quick-backup | restore | verify | exit
+Actions: backup | safe-backup | quick-backup | restore | verify | exit
 TXT
     while true; do
       printf 'Action: '
@@ -747,6 +877,13 @@ TXT
           printf 'Backup root [%s]: ' "$BACKUP_ROOT"; read -r dir; dir="${dir:-$BACKUP_ROOT}"
           printf 'Backup name (blank=auto): '; read -r name
           backup_drive "$disk" "$dir" "$name"
+          ;;
+        safe-backup)
+          local sdisk sdir sname
+          printf 'Source disk [%s]: ' "$SOURCE_DISK"; read -r sdisk; sdisk="${sdisk:-$SOURCE_DISK}"
+          printf 'Backup root [%s]: ' "$BACKUP_ROOT"; read -r sdir; sdir="${sdir:-$BACKUP_ROOT}"
+          printf 'Backup name (blank=auto): '; read -r sname
+          backup_drive_full_image "$sdisk" "$sdir" "$sname"
           ;;
         quick-backup)
           backup_drive "auto" "$BACKUP_ROOT" ""
@@ -772,9 +909,9 @@ TXT
 usage() {
   cat <<'TXT'
 Usage:
-  disk_imager.sh preflight --source <disk|auto> [--backup-root <dir>] [--backup-dir <dir>] [--target <disk>]
-  disk_imager.sh quick-backup|qb [--source <disk|auto>] [--backup-root <dir>] [--name <backup-name>]
-  disk_imager.sh backup  --source <disk|auto> --backup-root <dir> [--name <backup-name>]
+  disk_imager.sh preflight --source <disk|auto> [--backup-root <dir>] [--backup-dir <dir>] [--target <disk>] [--safe-full-image]
+  disk_imager.sh quick-backup|qb [--source <disk|auto>] [--backup-root <dir>] [--name <backup-name>] [--safe-full-image]
+  disk_imager.sh backup  --source <disk|auto> --backup-root <dir> [--name <backup-name>] [--safe-full-image]
   disk_imager.sh restore --target <disk> --backup-dir <dir> [--yes]
   disk_imager.sh verify  --backup-dir <dir> [--compare-disk <disk>]
   disk_imager.sh tui
@@ -798,6 +935,7 @@ main() {
   local compare_disk=""
   local name=""
   local yes=0
+  local safe_full_image=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -807,6 +945,7 @@ main() {
       --backup-dir) backup_dir="$2"; shift 2 ;;
       --compare-disk) compare_disk="$2"; shift 2 ;;
       --name) name="$2"; shift 2 ;;
+      --safe-full-image) safe_full_image=1; shift ;;
       --yes) yes=1; shift ;;
       --debug) DEBUG=1; shift ;;
       --log-file) LOG_FILE="$2"; shift 2 ;;
@@ -832,17 +971,29 @@ main() {
   case "$cmd" in
     preflight)
       source="$(resolve_source_disk "$source")"
-      preflight_backup "$source" "$backup_root"
+      if [[ "$safe_full_image" == "1" ]]; then
+        preflight_backup "$source" "$backup_root" "full-disk-image"
+      else
+        preflight_backup "$source" "$backup_root" "partitioned-images"
+      fi
       if [[ -n "$backup_dir" ]]; then
         target="$(resolve_source_disk "$target")"
-        preflight_restore "$target" "$backup_dir"
+        preflight_restore "$target" "$backup_dir" "$(backup_mode_from_dir "$backup_dir")"
       fi
       ;;
     backup)
-      backup_drive "$source" "$backup_root" "$name"
+      if [[ "$safe_full_image" == "1" ]]; then
+        backup_drive_full_image "$source" "$backup_root" "$name"
+      else
+        backup_drive "$source" "$backup_root" "$name"
+      fi
       ;;
     quick-backup|qb)
-      backup_drive "${source:-auto}" "$backup_root" "$name"
+      if [[ "$safe_full_image" == "1" ]]; then
+        backup_drive_full_image "${source:-auto}" "$backup_root" "$name"
+      else
+        backup_drive "${source:-auto}" "$backup_root" "$name"
+      fi
       ;;
     restore)
       [[ -n "$backup_dir" ]] || die "--backup-dir is required for restore"

@@ -472,8 +472,41 @@ run_realistic_nvme_tests() {
   "$ROOT_DIR/disk_imager.sh" verify --backup-dir "$snap" --compare-disk /dev/nvme0n1 >/dev/null
 }
 
+run_full_disk_safe_mode_tests() {
+  local bin_dir="$TMP_DIR/mockbin-safe-full"
+  setup_fallback_mocks "$bin_dir"
+
+  export PATH="$bin_dir:/usr/bin:/bin"
+  export SKIP_ROOT_CHECK=1
+  export DISK_IMAGER_SKIP_RAW_HEADERS=0
+  export MOCK_LOG
+
+  local backup_root="$TMP_DIR/backups-safe-full"
+  mkdir -p "$backup_root"
+
+  "$ROOT_DIR/disk_imager.sh" backup --source /dev/mock0 --backup-root "$backup_root" --name snap-safe --safe-full-image >/dev/null
+
+  local snap="$backup_root/snap-safe"
+  assert_file "$snap/manifest.tsv"
+  assert_file "$snap/checksums.txt"
+  assert_file "$snap/disk-full.img.gz"
+  assert_file "$snap/metadata.txt"
+  assert_file "$snap/audit_report.txt"
+  assert_contains "backup_mode=full-disk-image" "$snap/metadata.txt"
+  assert_contains $'disk\tfull\tdd+gzip\tdisk-full.img.gz' "$snap/manifest.tsv"
+  assert_contains "result=ok" "$snap/audit_report.txt"
+
+  (cd "$snap" && sha256sum -c checksums.txt >/dev/null)
+  "$ROOT_DIR/disk_imager.sh" verify --backup-dir "$snap" --compare-disk /dev/mock0 >/dev/null
+
+  : > "$MOCK_LOG"
+  "$ROOT_DIR/disk_imager.sh" restore --target /dev/mock1 --backup-dir "$snap" --yes >/dev/null
+  assert_contains "dd_write:/dev/mock1:if=:seek=0" "$MOCK_LOG"
+}
+
 run_normal_path_tests
 run_fallback_path_tests
 run_realistic_nvme_tests
+run_full_disk_safe_mode_tests
 
 echo "All tests passed"
