@@ -39,6 +39,27 @@ has_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
+available_disks_text() {
+  if has_cmd lsblk; then
+    lsblk -dnpo NAME,TYPE,SIZE,MODEL 2>/dev/null | awk '$2=="disk"{print $1" size="$3" model="$4}'
+  elif [[ -d /sys/block ]]; then
+    ls /sys/block 2>/dev/null | sed 's#^#/dev/#'
+  fi
+}
+
+show_available_disks() {
+  local disks
+  disks="$(available_disks_text || true)"
+  if [[ -n "$disks" ]]; then
+    err "Available disks detected:"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && err "  $line"
+    done <<< "$disks"
+  else
+    err "No disks detected via lsblk/sysfs in this environment."
+  fi
+}
+
 require_root() {
   if [[ "$SKIP_ROOT_CHECK" == "1" ]]; then
     return
@@ -59,6 +80,15 @@ resolve_disk_device() {
     return
   fi
 
+  if [[ -L "$disk" ]]; then
+    local resolved
+    resolved="$(readlink -f "$disk" 2>/dev/null || true)"
+    if [[ -n "$resolved" && -b "$resolved" ]]; then
+      printf '%s\n' "$resolved"
+      return
+    fi
+  fi
+
   # Common pitfall: /dev/nvme0 is a controller node, while /dev/nvme0n1 is the disk.
   if [[ "$disk" =~ ^/dev/nvme[0-9]+$ ]] && [[ -b "${disk}n1" ]]; then
     log "Device $disk is a controller node; using ${disk}n1"
@@ -66,6 +96,12 @@ resolve_disk_device() {
     return
   fi
 
+  if [[ "$disk" =~ ^/dev/nvme[0-9]+n[0-9]+$ ]]; then
+    err "Path exists but is not a usable block disk node: $disk"
+    err "This usually means your current environment cannot access raw host disks."
+    err "Run from a real Linux live system (not a restricted container/VM shell) and verify with: lsblk -d -o NAME,PATH,TYPE,SIZE"
+  fi
+  show_available_disks
   die "Device is not a block disk: $disk (for NVMe use /dev/nvmeXn1)"
 }
 
