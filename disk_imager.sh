@@ -19,6 +19,7 @@ NAME_PREFIX="${NAME_PREFIX:-$DEFAULT_NAME_PREFIX}"
 
 SKIP_ROOT_CHECK="${SKIP_ROOT_CHECK:-0}"
 SKIP_RAW_HEADERS="${DISK_IMAGER_SKIP_RAW_HEADERS:-0}"
+ALLOW_MOUNTED_SOURCE="${ALLOW_MOUNTED_SOURCE:-0}"
 DEBUG="${DEBUG:-0}"
 LOG_FILE="${DISK_IMAGER_LOG_FILE:-}"
 
@@ -35,6 +36,28 @@ debug_log() {
   if [[ "${DEBUG:-0}" == "1" ]]; then
     _write_log_line "[DEBUG $(date '+%F %T')] $*"
   fi
+}
+
+run_cmd_logged() {
+  local label="$1"
+  shift
+  local tmp rc line
+  tmp="$(mktemp /tmp/disk_imager_cmd.XXXXXX)"
+  if "$@" >"$tmp" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    err "$label failed (exit=$rc)"
+    while IFS= read -r line; do
+      debug_log "$label: $line"
+    done <"$tmp"
+  else
+    debug_log "$label exit=0"
+  fi
+  rm -f "$tmp"
+  return "$rc"
 }
 err() { _write_log_line "ERROR: $*"; }
 die() {
@@ -230,8 +253,8 @@ partclone_tool_for_fstype() {
     swap) echo "partclone.swap" ;;
     reiserfs) echo "partclone.reiserfs" ;;
     hfsplus) echo "partclone.hfsp" ;;
-    "") echo "partclone.dd" ;;
-    *) echo "partclone.dd" ;;
+    ""|unknown) echo "" ;;
+    *) echo "" ;;
   esac
 }
 
@@ -280,6 +303,101 @@ list_partitions() {
   lsblk -lnpo NAME,TYPE,FSTYPE "$disk" | awk '$2 == "part" {print $1"\t"$3}'
 }
 
+ensure_source_not_mounted() {
+  local disk="$1"
+  [[ "$ALLOW_MOUNTED_SOURCE" == "1" ]] && return 0
+  [[ "$SKIP_ROOT_CHECK" == "1" ]] && return 0
+
+  local part mounted
+  while IFS=$'\t' read -r part _; do
+    [[ -n "$part" ]] || continue
+    mounted="$(lsblk -no MOUNTPOINT "$part" 2>/dev/null | awk 'NF{print; exit}' || true)"
+    if [[ -n "$mounted" ]]; then
+      die "Source partition is mounted ($part -> $mounted). Unmount it first, or set ALLOW_MOUNTED_SOURCE=1."
+    fi
+  done < <(list_partitions "$disk")
+}
+
+collect_partition_inventory() {
+  local disk="$1"
+  local outdir="$2"
+  local inv="$outdir/inventory.tsv"
+  : >"$inv"
+
+  local part fstype partn size partuuid uuid
+  while IFS=$'\t' read -r part fstype; do
+    [[ -n "$part" ]] || continue
+    partn="$(lsblk -no PARTN "$part" | tr -d '[:space:]')"
+    size="$(blockdev --getsize64 "$part" 2>/dev/null || echo 0)"
+    partuuid="$(lsblk -no PARTUUID "$part" 2>/dev/null | tr -d '[:space:]' || true)"
+    uuid="$(lsblk -no UUID "$part" 2>/dev/null | tr -d '[:space:]' || true)"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$partn" "$part" "${fstype:-unknown}" "$size" "${partuuid:-}" "${uuid:-}" >>"$inv"
+  done < <(list_partitions "$disk")
+}
+
+validate_image_integrity() {
+  local backup_dir="$1"
+  local tool="$2"
+  local relimg="$3"
+  local img="$backup_dir/$relimg"
+
+  if [[ "$img" == *.gz ]]; then
+    run_cmd_logged "gzip integrity $relimg" gzip -t "$img" || return 1
+    return 0
+  fi
+
+  if [[ "$tool" != "dd+gzip" ]] && has_cmd partclone.chkimg; then
+    run_cmd_logged "partclone image check $relimg" partclone.chkimg -s "$img" || return 1
+  fi
+  return 0
+}
+
+post_backup_audit() {
+  local backup_dir="$1"
+  local inv="$backup_dir/inventory.tsv"
+  local report="$backup_dir/audit_report.txt"
+
+  [[ -f "$inv" ]] || die "Missing inventory.tsv"
+  [[ -f "$backup_dir/manifest.tsv" ]] || die "Missing manifest.tsv"
+  [[ -f "$backup_dir/checksums.txt" ]] || die "Missing checksums.txt"
+
+  : >"$report"
+  {
+    echo "backup_audit_time_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    echo "result=running"
+  } >>"$report"
+
+  local expected_count actual_count
+  expected_count="$(awk 'NF>0{c++} END{print c+0}' "$inv")"
+  actual_count="$(awk 'NF>0{c++} END{print c+0}' "$backup_dir/manifest.tsv")"
+  [[ "$expected_count" == "$actual_count" ]] || die "Audit failed: partition count mismatch inventory=$expected_count manifest=$actual_count"
+
+  log "Audit: checking checksums"
+  run_cmd_logged "checksum audit" bash -c 'cd "$1" && sha256sum -c checksums.txt >/dev/null' _ "$backup_dir" || die "Audit failed: checksum mismatch"
+
+  local partn part fstype size partuuid uuid mf_fstype tool relimg img_bytes
+  while IFS=$'\t' read -r partn part fstype size partuuid uuid; do
+    [[ -n "$partn" ]] || continue
+    if ! IFS=$'\t' read -r _ mf_fstype tool relimg < <(awk -F'\t' -v p="$partn" '$1==p{print $1"\t"$2"\t"$3"\t"$4; exit}' "$backup_dir/manifest.tsv"); then
+      die "Audit failed: missing manifest entry for partition number $partn"
+    fi
+    [[ -n "$relimg" ]] || die "Audit failed: missing image mapping for partition number $partn"
+    [[ -f "$backup_dir/$relimg" ]] || die "Audit failed: missing image file $relimg"
+
+    img_bytes="$(stat -c '%s' "$backup_dir/$relimg" 2>/dev/null || echo 0)"
+    [[ "$img_bytes" =~ ^[0-9]+$ ]] || img_bytes=0
+    (( img_bytes > 0 )) || die "Audit failed: image is empty $relimg"
+
+    validate_image_integrity "$backup_dir" "$tool" "$relimg" || die "Audit failed: integrity check failed for $relimg"
+    printf 'partition=%s source=%s fstype=%s size_bytes=%s image=%s image_bytes=%s method=%s\n' \
+      "$partn" "$part" "$fstype" "$size" "$relimg" "$img_bytes" "$tool" >>"$report"
+  done <"$inv"
+
+  echo "result=ok" >>"$report"
+  log "Audit passed: $report"
+}
+
 preflight_backup() {
   local disk="$1"
   local backup_root="$2"
@@ -288,6 +406,11 @@ preflight_backup() {
   log "Preflight (backup)"
   log "Source disk: $disk"
   log "Backup root: $backup_root"
+  if [[ "$ALLOW_MOUNTED_SOURCE" == "1" ]]; then
+    log "Mounted source check: disabled (ALLOW_MOUNTED_SOURCE=1)"
+  else
+    log "Mounted source check: enabled"
+  fi
 
   if has_cmd sfdisk; then
     mode_ptable="sfdisk"
@@ -306,10 +429,10 @@ preflight_backup() {
   while IFS=$'\t' read -r part fstype; do
     [[ -n "$part" ]] || continue
     tool="$(partclone_tool_for_fstype "$fstype")"
-    if has_cmd "$tool"; then
+    if [[ -n "$tool" ]] && has_cmd "$tool"; then
       log "Partition $part fstype=${fstype:-unknown} -> method=partclone ($tool)"
     else
-      log "Partition $part fstype=${fstype:-unknown} -> method=dd+gzip (missing $tool)"
+      log "Partition $part fstype=${fstype:-unknown} -> method=dd+gzip"
     fi
   done < <(list_partitions "$disk")
 }
@@ -367,8 +490,10 @@ backup_drive() {
   outdir="${backup_root%/}/$backup_name"
 
   preflight_backup "$disk" "$backup_root"
+  ensure_source_not_mounted "$disk"
   ensure_backup_dir "$outdir"
   save_metadata "$disk" "$outdir"
+  collect_partition_inventory "$disk" "$outdir"
 
   : >"$outdir/manifest.tsv"
   : >"$outdir/checksums.txt"
@@ -386,17 +511,23 @@ backup_drive() {
     fi
 
     tool="$(partclone_tool_for_fstype "$fstype")"
-    if has_cmd "$tool"; then
+    if [[ -n "$tool" ]] && has_cmd "$tool"; then
       relimg="part-${partn}-${fstype:-unknown}.img"
       img="$outdir/$relimg"
       log "Backing up $part (fstype=${fstype:-unknown}, method=partclone, tool=$tool)"
-      "$tool" -c -s "$part" -o "$img"
+      if ! run_cmd_logged "partclone backup $part via $tool" "$tool" -c -s "$part" -o "$img"; then
+        log "partclone failed for $part, falling back to dd+gzip"
+        tool="dd+gzip"
+        relimg="part-${partn}-${fstype:-unknown}.img.gz"
+        img="$outdir/$relimg"
+        run_cmd_logged "dd+gzip backup $part" bash -c 'dd if="$1" bs=16M status=none | gzip -1 >"$2"' _ "$part" "$img" || die "dd+gzip backup failed for $part"
+      fi
     else
       tool="dd+gzip"
       relimg="part-${partn}-${fstype:-unknown}.img.gz"
       img="$outdir/$relimg"
       log "Backing up $part (fstype=${fstype:-unknown}, method=dd+gzip)"
-      dd if="$part" bs=16M status=none | gzip -1 >"$img"
+      run_cmd_logged "dd+gzip backup $part" bash -c 'dd if="$1" bs=16M status=none | gzip -1 >"$2"' _ "$part" "$img" || die "dd+gzip backup failed for $part"
     fi
 
     sum="$(sha256sum "$img" | awk '{print $1}')"
@@ -404,6 +535,7 @@ backup_drive() {
     printf '%s\t%s\t%s\t%s\n' "$partn" "${fstype:-unknown}" "$tool" "$relimg" >>"$outdir/manifest.tsv"
   done < <(list_partitions "$disk")
 
+  post_backup_audit "$outdir"
   log "Backup finished: $outdir"
   printf '%s\n' "$outdir"
 }
@@ -492,17 +624,17 @@ restore_drive() {
 
   if has_cmd sfdisk && [[ -f "$backup_dir/partition_table.sfdisk" ]]; then
     log "Restoring partition table onto $target_disk using sfdisk"
-    sfdisk "$target_disk" <"$backup_dir/partition_table.sfdisk"
+    run_cmd_logged "sfdisk restore $target_disk" bash -c 'sfdisk "$1" <"$2"' _ "$target_disk" "$backup_dir/partition_table.sfdisk" || die "sfdisk restore failed for $target_disk"
   else
     log "sfdisk unavailable or missing table dump; restoring raw table headers with dd+gzip"
     [[ -f "$backup_dir/disk-head-2MiB.bin.gz" ]] || die "Missing disk-head-2MiB.bin.gz"
-    gzip -dc "$backup_dir/disk-head-2MiB.bin.gz" | dd of="$target_disk" bs=512 conv=fsync status=none
+    run_cmd_logged "raw header restore head $target_disk" bash -c 'gzip -dc "$1" | dd of="$2" bs=512 conv=fsync status=none' _ "$backup_dir/disk-head-2MiB.bin.gz" "$target_disk" || die "Failed restoring disk head to $target_disk"
     if [[ -f "$backup_dir/disk-tail-2MiB.bin.gz" ]] && has_cmd blockdev; then
       local sectors start
       sectors="$(blockdev --getsz "$target_disk" 2>/dev/null || echo 0)"
       if [[ "$sectors" =~ ^[0-9]+$ ]] && (( sectors > 4096 )); then
         start=$((sectors - 4096))
-        gzip -dc "$backup_dir/disk-tail-2MiB.bin.gz" | dd of="$target_disk" bs=512 seek="$start" conv=fsync status=none
+        run_cmd_logged "raw header restore tail $target_disk" bash -c 'gzip -dc "$1" | dd of="$2" bs=512 seek="$3" conv=fsync status=none' _ "$backup_dir/disk-tail-2MiB.bin.gz" "$target_disk" "$start" || die "Failed restoring disk tail to $target_disk"
       fi
     fi
   fi
@@ -520,15 +652,22 @@ restore_drive() {
 
     if [[ "$tool" == "dd+gzip" ]]; then
       log "Restoring partition $target_part using dd+gzip"
-      gzip -dc "$img" | dd of="$target_part" bs=16M conv=fsync status=none
+      run_cmd_logged "dd+gzip restore $target_part" bash -c 'gzip -dc "$1" | dd of="$2" bs=16M conv=fsync status=none' _ "$img" "$target_part" || die "dd+gzip restore failed for $target_part"
     else
       if has_cmd "$tool"; then
         log "Restoring partition $target_part using $tool"
-        "$tool" -r -s "$img" -o "$target_part"
+        if ! run_cmd_logged "partclone restore $target_part via $tool" "$tool" -r -s "$img" -o "$target_part"; then
+          if [[ "$img" == *.gz ]]; then
+            log "partclone restore failed; falling back to dd+gzip for $target_part"
+            run_cmd_logged "dd+gzip restore fallback $target_part" bash -c 'gzip -dc "$1" | dd of="$2" bs=16M conv=fsync status=none' _ "$img" "$target_part" || die "Fallback dd+gzip restore failed for $target_part"
+          else
+            die "Restore failed for $target_part using $tool; no gzip fallback image available"
+          fi
+        fi
       else
         if [[ "$img" == *.gz ]]; then
           log "Tool $tool unavailable, falling back to dd+gzip restore for $target_part"
-          gzip -dc "$img" | dd of="$target_part" bs=16M conv=fsync status=none
+          run_cmd_logged "dd+gzip restore fallback $target_part" bash -c 'gzip -dc "$1" | dd of="$2" bs=16M conv=fsync status=none' _ "$img" "$target_part" || die "Fallback dd+gzip restore failed for $target_part"
         else
           die "Restore tool $tool is unavailable and image is not gzip fallback format: $img"
         fi

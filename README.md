@@ -10,10 +10,29 @@ Fallback behavior (automatic when tools are missing):
 - Partition table: `dd + gzip` raw headers
 - Partition images: `dd + gzip`
 
+Backup safety checks (automatic):
+- Fails if source partitions are mounted (unless `ALLOW_MOUNTED_SOURCE=1`)
+- Verifies every expected partition has an image
+- Re-validates `sha256` checksums at end of backup
+- Validates image integrity (`gzip -t` for gzip images, `partclone.chkimg` when available)
+- Writes `audit_report.txt` in the backup folder
+
 ## Files
 - `disk_imager.sh`: main script (CLI + TUI)
 - `disk_imager.conf`: defaults (`SOURCE_DISK`, `BACKUP_ROOT`, `NAME_PREFIX`)
-- `tests/run_tests.sh`: mock tests for normal and fallback paths
+- `tests/run_tests.sh`: mock tests for normal, fallback, and realistic NVMe layouts
+
+## Backup Folder Contents
+
+Each backup snapshot directory contains:
+- `partition_table.sfdisk` and `partition_table.json` (when `sfdisk` is available)
+- `disk-head-2MiB.bin.gz` and `disk-tail-2MiB.bin.gz` (raw table/header fallback data)
+- `manifest.tsv` (partition -> image mapping + method used)
+- `inventory.tsv` (captured source partition inventory before imaging)
+- `checksums.txt` (sha256 for each image)
+- `audit_report.txt` (post-backup audit result; must include `result=ok`)
+- `lsblk.json`, `partitions.tsv`, `metadata.txt`
+- `part-*.img` or `part-*.img.gz` image files
 
 ## Basic Usage
 
@@ -34,6 +53,9 @@ Short command (auto source + default backup root + debug log):
 ```bash
 sudo /share/saveas/disk_imager.sh qb
 ```
+
+This command auto-writes debug logs to:
+- `/tmp/disk_imager_quick_YYYYMMDD_HHMMSS.log`
 
 Verify backup:
 
@@ -97,6 +119,43 @@ sudo tail -n 200 /tmp/disk_imager_remote_debug.log
 sudo tail -n 200 /tmp/disk_imager_remote_backup.log
 ```
 
+## Post-Backup Validation
+
+Backup is considered successful only after automatic audit passes.
+
+Required signals:
+- script exits with code `0`
+- `audit_report.txt` exists in backup folder
+- `audit_report.txt` contains `result=ok`
+
+Quick manual check:
+
+```bash
+grep -F "result=ok" /root/samba/<backup-folder>/audit_report.txt
+```
+
+Optional full verification:
+
+```bash
+sudo /share/saveas/disk_imager.sh verify --backup-dir /root/samba/<backup-folder>
+```
+
+## Tests
+
+Run all mock tests:
+
+```bash
+./tests/run_tests.sh
+```
+
+Current suites:
+- Normal path: `sfdisk + partclone`
+- Fallback path: no `sfdisk`/`partclone` -> `dd+gzip`
+- Realistic NVMe path:
+  - disk `/dev/nvme0n1`
+  - partitions `p1 vfat`, `p2 unknown/MSR-like`, `p3 ntfs`, `p4 ntfs`
+  - asserts `p2` uses `dd+gzip` while filesystem partitions use `partclone`
+
 ## Command Reference
 
 ```bash
@@ -113,3 +172,4 @@ disk_imager.sh tui
 - `restore` is destructive and overwrites target disk structures and partition content.
 - Always run `preflight` before `backup` and `restore`.
 - Keep multiple backup snapshots before wiping a Windows disk.
+- Default backup behavior refuses mounted source partitions for consistency.

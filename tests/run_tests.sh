@@ -223,6 +223,152 @@ setup_fallback_mocks() {
   # Intentionally no sfdisk and no partclone binaries in fallback mode.
 }
 
+setup_realistic_nvme_mocks() {
+  local bin_dir="$1"
+  setup_common_mocks "$bin_dir"
+
+  cat > "$bin_dir/lsblk" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+
+case "$args" in
+  "-lnpo NAME,TYPE,FSTYPE /dev/nvme0n1")
+    cat <<'OUT'
+/dev/nvme0n1 disk
+/dev/nvme0n1p1 part vfat
+/dev/nvme0n1p2 part
+/dev/nvme0n1p3 part ntfs
+/dev/nvme0n1p4 part ntfs
+OUT
+    ;;
+  "-no PARTN /dev/nvme0n1p1") echo 1 ;;
+  "-no PARTN /dev/nvme0n1p2") echo 2 ;;
+  "-no PARTN /dev/nvme0n1p3") echo 3 ;;
+  "-no PARTN /dev/nvme0n1p4") echo 4 ;;
+  "-J -b -o NAME,PATH,SIZE,TYPE,FSTYPE,PARTUUID,UUID,LABEL /dev/nvme0n1")
+    cat <<'OUT'
+{"blockdevices":[{"name":"nvme0n1","path":"/dev/nvme0n1","size":512110190592,"type":"disk","children":[{"name":"nvme0n1p1","path":"/dev/nvme0n1p1","size":104857600,"type":"part","fstype":"vfat"},{"name":"nvme0n1p2","path":"/dev/nvme0n1p2","size":16777216,"type":"part","fstype":null},{"name":"nvme0n1p3","path":"/dev/nvme0n1p3","size":510242791424,"type":"part","fstype":"ntfs"},{"name":"nvme0n1p4","path":"/dev/nvme0n1p4","size":1048576000,"type":"part","fstype":"ntfs"}]}]}
+OUT
+    ;;
+  "-lnbpo NAME,TYPE,SIZE,FSTYPE /dev/nvme0n1")
+    cat <<'OUT'
+/dev/nvme0n1 disk 512110190592
+/dev/nvme0n1p1 part 104857600 vfat
+/dev/nvme0n1p2 part 16777216
+/dev/nvme0n1p3 part 510242791424 ntfs
+/dev/nvme0n1p4 part 1048576000 ntfs
+OUT
+    ;;
+  "-lnpo NAME,TYPE /dev/nvme0n1")
+    cat <<'OUT'
+/dev/nvme0n1 disk
+/dev/nvme0n1p1 part
+/dev/nvme0n1p2 part
+/dev/nvme0n1p3 part
+/dev/nvme0n1p4 part
+OUT
+    ;;
+  "-no FSTYPE /dev/nvme0n1p1") echo vfat ;;
+  "-no FSTYPE /dev/nvme0n1p2") echo "" ;;
+  "-no FSTYPE /dev/nvme0n1p3") echo ntfs ;;
+  "-no FSTYPE /dev/nvme0n1p4") echo ntfs ;;
+  "-no PARTUUID /dev/nvme0n1p1") echo "1111-AAAA" ;;
+  "-no PARTUUID /dev/nvme0n1p2") echo "2222-BBBB" ;;
+  "-no PARTUUID /dev/nvme0n1p3") echo "3333-CCCC" ;;
+  "-no PARTUUID /dev/nvme0n1p4") echo "4444-DDDD" ;;
+  "-no UUID /dev/nvme0n1p1") echo "EFI-UUID" ;;
+  "-no UUID /dev/nvme0n1p2") echo "" ;;
+  "-no UUID /dev/nvme0n1p3") echo "WIN-UUID" ;;
+  "-no UUID /dev/nvme0n1p4") echo "REC-UUID" ;;
+  *)
+    echo "Unexpected lsblk args: $args" >&2
+    exit 1
+    ;;
+esac
+MOCK
+  chmod +x "$bin_dir/lsblk"
+
+  cat > "$bin_dir/blkid" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+part="${*: -1}"
+case "$part" in
+  /dev/nvme0n1p1) echo vfat ;;
+  /dev/nvme0n1p3|/dev/nvme0n1p4) echo ntfs ;;
+  /dev/nvme0n1p2) exit 1 ;;
+  *) exit 1 ;;
+esac
+MOCK
+  chmod +x "$bin_dir/blkid"
+
+  cat > "$bin_dir/blockdev" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "--getsz" ]]; then
+  echo 100000
+elif [[ "${1:-}" == "--getsize64" ]]; then
+  echo 104857600
+else
+  exit 1
+fi
+MOCK
+  chmod +x "$bin_dir/blockdev"
+
+  cat > "$bin_dir/sfdisk" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "--dump" ]]; then
+  cat <<'OUT'
+label: gpt
+device: /dev/nvme0n1
+unit: sectors
+
+/dev/nvme0n1p1 : start=2048, size=204800, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
+/dev/nvme0n1p2 : start=206848, size=32768, type=E3C9E316-0B5C-4DB8-817D-F92DF00215AE
+/dev/nvme0n1p3 : start=239616, size=996567040, type=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
+/dev/nvme0n1p4 : start=996806656, size=2048000, type=DE94BBA4-06D1-4D40-A16A-BFD50179D6AC
+OUT
+elif [[ "${1:-}" == "--json" ]]; then
+  echo '{"partitiontable":{"label":"gpt","device":"/dev/nvme0n1","partitions":[{"node":"/dev/nvme0n1p1"},{"node":"/dev/nvme0n1p2"},{"node":"/dev/nvme0n1p3"},{"node":"/dev/nvme0n1p4"}]}}'
+else
+  disk="${1:-unknown}"
+  cat >/dev/null
+  echo "sfdisk_restore:${disk}" >> "${MOCK_LOG}"
+fi
+MOCK
+  chmod +x "$bin_dir/sfdisk"
+
+  cat > "$bin_dir/partclone-mock" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+mode=""
+src=""
+out=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -c) mode="clone"; shift ;;
+    -r) mode="restore"; shift ;;
+    -s) src="$2"; shift 2 ;;
+    -o) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+name="$(basename "$0")"
+if [[ "$mode" == "clone" ]]; then
+  echo "${name}:$src" > "$out"
+elif [[ "$mode" == "restore" ]]; then
+  echo "restore:${name}:${src}:${out}" >> "${MOCK_LOG}"
+else
+  echo "invalid mode" >&2
+  exit 1
+fi
+MOCK
+  chmod +x "$bin_dir/partclone-mock"
+  ln -s "$bin_dir/partclone-mock" "$bin_dir/partclone.fat"
+  ln -s "$bin_dir/partclone-mock" "$bin_dir/partclone.ntfs"
+}
+
 run_normal_path_tests() {
   local bin_dir="$TMP_DIR/mockbin-normal"
   setup_normal_mocks "$bin_dir"
@@ -292,7 +438,42 @@ run_fallback_path_tests() {
   assert_contains "dd_write:/dev/mock1p2:if=:seek=0" "$MOCK_LOG"
 }
 
+run_realistic_nvme_tests() {
+  local bin_dir="$TMP_DIR/mockbin-nvme"
+  setup_realistic_nvme_mocks "$bin_dir"
+
+  export PATH="$bin_dir:/usr/bin:/bin"
+  export SKIP_ROOT_CHECK=1
+  export DISK_IMAGER_SKIP_RAW_HEADERS=1
+  export MOCK_LOG
+
+  local backup_root="$TMP_DIR/backups-nvme"
+  mkdir -p "$backup_root"
+
+  "$ROOT_DIR/disk_imager.sh" backup --source /dev/nvme0n1 --backup-root "$backup_root" --name snap-nvme >/dev/null
+
+  local snap="$backup_root/snap-nvme"
+  assert_file "$snap/manifest.tsv"
+  assert_file "$snap/checksums.txt"
+  assert_file "$snap/partition_table.sfdisk"
+  assert_file "$snap/inventory.tsv"
+  assert_file "$snap/audit_report.txt"
+  assert_file "$snap/part-1-vfat.img"
+  assert_file "$snap/part-2-unknown.img.gz"
+  assert_file "$snap/part-3-ntfs.img"
+  assert_file "$snap/part-4-ntfs.img"
+
+  assert_contains $'1\tvfat\tpartclone.fat\tpart-1-vfat.img' "$snap/manifest.tsv"
+  assert_contains $'2\tunknown\tdd+gzip\tpart-2-unknown.img.gz' "$snap/manifest.tsv"
+  assert_contains $'3\tntfs\tpartclone.ntfs\tpart-3-ntfs.img' "$snap/manifest.tsv"
+  assert_contains $'4\tntfs\tpartclone.ntfs\tpart-4-ntfs.img' "$snap/manifest.tsv"
+  assert_contains "result=ok" "$snap/audit_report.txt"
+
+  "$ROOT_DIR/disk_imager.sh" verify --backup-dir "$snap" --compare-disk /dev/nvme0n1 >/dev/null
+}
+
 run_normal_path_tests
 run_fallback_path_tests
+run_realistic_nvme_tests
 
 echo "All tests passed"
